@@ -47,13 +47,23 @@ def validate_config(config):
         if not config.get(k, None):
             errors.append(f'Required key is missing from config: [{k}]')
 
-    possible_authentication_keys =  [
-      'password',
-      'private_key_path'
-    ]
-    if not any(config.get(k, None) for k in possible_authentication_keys):
-        errors.append(
-            f'Required authentication key missing. Existing methods: {",".join(possible_authentication_keys)}')
+    has_password = bool(config.get('password'))
+    has_key_path = bool(config.get('private_key_path'))
+    has_key_content = bool(config.get('private_key_content'))
+    has_passphrase = bool(config.get('private_key_passphrase'))
+    using_keypair = has_key_path or has_key_content
+
+    if has_key_path and has_key_content:
+        errors.append("Provide only one of 'private_key_path' or 'private_key_content', not both")
+
+    if not has_password and not using_keypair:
+        errors.append("Must provide one of: 'password', 'private_key_path', or 'private_key_content'")
+    elif has_password and using_keypair:
+        errors.append("Cannot mix password and keypair authentication. Provide only one method")
+
+    if has_passphrase and not using_keypair:
+        errors.append("'private_key_passphrase' is set but no private key is provided. "
+                      "Passphrase is only used with keypair authentication")
 
     return errors
 
@@ -75,28 +85,37 @@ class SnowflakeConnection:
 
     def get_private_key(self):
         """
-        Get private key from the right location
+        Get private key bytes from private_key_path or private_key_content.
+        Returns None when password auth is used.
         """
+        passphrase = self.connection_config.get('private_key_passphrase')
+        encoded_passphrase = passphrase.encode() if passphrase else None
+
         if self.connection_config.get('private_key_path'):
-            try:
-                encoded_passphrase = self.connection_config['private_key_passphrase'].encode()
-            except KeyError:
-                encoded_passphrase = None
-
             with open(self.connection_config['private_key_path'], 'rb') as key:
-                p_key= serialization.load_pem_private_key(
-                        key.read(),
-                        password=encoded_passphrase,
-                        backend=default_backend()
-                    )
+                pem_data = key.read()
+        elif self.connection_config.get('private_key_content'):
+            pem_data = self.connection_config['private_key_content'].strip().encode('utf-8')
+        else:
+            return None
 
-            pkb = p_key.private_bytes(
-                    encoding=serialization.Encoding.DER,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption())
-            return pkb
+        try:
+            p_key = serialization.load_pem_private_key(
+                pem_data,
+                password=encoded_passphrase,
+                backend=default_backend()
+            )
+        except Exception as exc:
+            raise Exception(
+                f'Failed to load private key. Ensure valid PKCS8 PEM format and correct passphrase. '
+                f'Error: {exc}'
+            ) from exc
 
-        return None
+        return p_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
 
     def open_connection(self):
         """Connect to snowflake database"""
